@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 )
@@ -18,9 +19,10 @@ const (
 	// Chunks are 256 KiB from clients; leave generous headroom.
 	maxMessageSize = 1<<20 + 1<<16
 	sendBufferSize = 256
-	// If a receiver cannot drain its queue for this long it is considered
-	// dead/stuck and gets disconnected instead of stalling the whole room.
-	slowPeerTimeout = 20 * time.Second
+	// Control / broadcast enqueue must not stall the room.
+	controlEnqueueWait = 750 * time.Millisecond
+	// Binary relay: short wait, then route-error (never block readPump for 20s).
+	relayEnqueueWait = 3 * time.Second
 )
 
 // Control message types that are relayed peer-to-peer verbatim (plus "from").
@@ -40,10 +42,12 @@ type outbound struct {
 }
 
 type Peer struct {
-	ID     string
+	ID   string
+	Room string
+
+	mu     sync.RWMutex
 	Name   string
 	Avatar string
-	Room   string
 	Ready  bool
 
 	hub  *Hub
@@ -69,6 +73,8 @@ func newPeer(hub *Hub, conn *websocket.Conn, name, avatar, room string) *Peer {
 }
 
 func (p *Peer) info() peerInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	return peerInfo{ID: p.ID, Name: p.Name, Avatar: p.Avatar, Ready: p.Ready}
 }
 
@@ -79,25 +85,34 @@ func (p *Peer) close() {
 	})
 }
 
-func (p *Peer) sendJSON(msg map[string]any) {
+func (p *Peer) sendJSON(msg map[string]any) bool {
 	data, err := json.Marshal(msg)
 	if err != nil {
-		return
+		return false
 	}
-	p.enqueue(outbound{websocket.TextMessage, data})
+	return p.tryEnqueue(outbound{websocket.TextMessage, data}, controlEnqueueWait)
 }
 
-// enqueue blocks (bounded) when the receiver is slower than the sender,
-// which propagates backpressure to the sending client through TCP.
-func (p *Peer) enqueue(m outbound) bool {
+// tryEnqueue never blocks longer than wait; returns false if the peer is gone or slow.
+func (p *Peer) tryEnqueue(m outbound, wait time.Duration) bool {
 	select {
 	case p.send <- m:
 		return true
 	case <-p.done:
 		return false
-	case <-time.After(slowPeerTimeout):
-		log.Printf("peer %s too slow, disconnecting", p.ID)
-		p.close()
+	default:
+	}
+	if wait <= 0 {
+		return false
+	}
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case p.send <- m:
+		return true
+	case <-p.done:
+		return false
+	case <-timer.C:
 		return false
 	}
 }
@@ -137,10 +152,7 @@ func (p *Peer) writePump() {
 
 	for {
 		select {
-		case msg, ok := <-p.send:
-			if !ok {
-				return
-			}
+		case msg := <-p.send:
 			_ = p.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if err := p.conn.WriteMessage(msg.kind, msg.data); err != nil {
 				return
@@ -156,6 +168,23 @@ func (p *Peer) writePump() {
 	}
 }
 
+func truncateRunes(s string, max int) string {
+	if max <= 0 || s == "" {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	i := 0
+	for idx := range s {
+		if i == max {
+			return s[:idx]
+		}
+		i++
+	}
+	return s
+}
+
 func (p *Peer) handleControl(data []byte) {
 	var msg map[string]any
 	if err := json.Unmarshal(data, &msg); err != nil {
@@ -167,17 +196,19 @@ func (p *Peer) handleControl(data []byte) {
 	case "rename":
 		name, _ := msg["name"].(string)
 		name = strings.TrimSpace(name)
-		if name == "" || len(name) > 48 {
+		if name == "" {
 			return
 		}
+		name = truncateRunes(name, 48)
+		p.mu.Lock()
 		p.Name = name
 		if avatar, ok := msg["avatar"].(string); ok {
 			avatar = strings.TrimSpace(avatar)
-			if len(avatar) > 96 {
-				avatar = avatar[:96]
+			if avatar != "" {
+				p.Avatar = truncateRunes(avatar, 96)
 			}
-			p.Avatar = avatar
 		}
+		p.mu.Unlock()
 		p.hub.broadcast(p, map[string]any{
 			"type": "peer-updated",
 			"peer": p.info(),
@@ -188,7 +219,9 @@ func (p *Peer) handleControl(data []byte) {
 		if !ok {
 			return
 		}
+		p.mu.Lock()
 		p.Ready = ready
+		p.mu.Unlock()
 		p.hub.broadcast(p, map[string]any{
 			"type": "peer-updated",
 			"peer": p.info(),
@@ -214,7 +247,13 @@ func (p *Peer) handleControl(data []byte) {
 	}
 	delete(msg, "to")
 	msg["from"] = p.ID
-	target.sendJSON(msg)
+	if !target.sendJSON(msg) {
+		p.sendJSON(map[string]any{
+			"type":    "route-error",
+			"tid":     msg["tid"],
+			"message": "peer is no longer available",
+		})
+	}
 }
 
 // Binary frame layout: [4-byte BE header length][JSON header][chunk payload].
@@ -257,5 +296,12 @@ func (p *Peer) handleBinary(data []byte) {
 	binary.BigEndian.PutUint32(frame[:4], uint32(len(newHeader)))
 	copy(frame[4:], newHeader)
 	copy(frame[4+len(newHeader):], payload)
-	target.enqueue(outbound{websocket.BinaryMessage, frame})
+	if !target.tryEnqueue(outbound{websocket.BinaryMessage, frame}, relayEnqueueWait) {
+		log.Printf("relay to %s failed (slow/gone), tid=%v", target.ID, header["tid"])
+		p.sendJSON(map[string]any{
+			"type":    "route-error",
+			"tid":     header["tid"],
+			"message": "peer is no longer available",
+		})
+	}
 }

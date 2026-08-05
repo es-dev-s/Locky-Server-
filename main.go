@@ -144,7 +144,7 @@ func main() {
 		_, _ = w.Write(hub.debugRoomsJSON())
 	})
 
-	addr := ":" + envOr("PORT", "8080")
+	addr := ":" + envOr("PORT", "8090")
 	log.Printf("locky backend listening on %s (lan room hint: %s)", addr, orDash(hostLANPrefix()))
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal(err)
